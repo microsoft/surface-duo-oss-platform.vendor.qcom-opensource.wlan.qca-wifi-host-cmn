@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017-2020 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2017-2021 The Linux Foundation. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
@@ -823,17 +823,55 @@ static void dp_rx_frag_pull_hdr(qdf_nbuf_t nbuf, uint16_t hdrsize)
  *
  * Construct a nbuf fraglist
  *
- * Returns: None
+ * Returns: QDF_STATUS
  */
-static void
-dp_rx_construct_fraglist(struct dp_peer *peer,
+static QDF_STATUS
+dp_rx_construct_fraglist(struct dp_peer *peer, int tid,
 		qdf_nbuf_t head, uint16_t hdrsize)
 {
 	qdf_nbuf_t msdu = qdf_nbuf_next(head);
 	qdf_nbuf_t rx_nbuf = msdu;
+	struct dp_rx_tid *rx_tid = &peer->rx_tid[tid];
 	uint32_t len = 0;
+	uint64_t cur_pn128[2] = {0, 0}, prev_pn128[2];
+	int out_of_order = 0;
+	int index;
+	int needs_pn_check = 0;
+
+	prev_pn128[0] = rx_tid->pn128[0];
+	prev_pn128[1] = rx_tid->pn128[1];
+
+	index = hal_rx_msdu_is_wlan_mcast(msdu) ? dp_sec_mcast : dp_sec_ucast;
+	if (qdf_likely(peer->security[index].sec_type != cdp_sec_type_none))
+		needs_pn_check = 1;
 
 	while (msdu) {
+		if (qdf_likely(needs_pn_check))
+			out_of_order = dp_rx_defrag_pn_check(msdu,
+							     &cur_pn128[0],
+							     &prev_pn128[0]);
+
+		if (qdf_unlikely(out_of_order)) {
+			dp_info_rl("cur_pn128[0] 0x%llx cur_pn128[1] 0x%llx prev_pn128[0] 0x%llx prev_pn128[1] 0x%llx",
+				   cur_pn128[0], cur_pn128[1],
+				   prev_pn128[0], prev_pn128[1]);
+			return QDF_STATUS_E_FAILURE;
+		}
+
+		prev_pn128[0] = cur_pn128[0];
+		prev_pn128[1] = cur_pn128[1];
+
+		/*
+		 * Broadcast and multicast frames should never be fragmented.
+		 * Iterating through all msdus and dropping fragments if even
+		 * one of them has mcast/bcast destination address.
+		 */
+		if (hal_rx_msdu_is_wlan_mcast(msdu)) {
+			QDF_TRACE(QDF_MODULE_ID_TXRX, QDF_TRACE_LEVEL_ERROR,
+				  "Dropping multicast/broadcast fragments");
+			return QDF_STATUS_E_FAILURE;
+		}
+
 		dp_rx_frag_pull_hdr(msdu, hdrsize);
 		len += qdf_nbuf_len(msdu);
 		msdu = qdf_nbuf_next(msdu);
@@ -849,6 +887,7 @@ dp_rx_construct_fraglist(struct dp_peer *peer,
 		  (uint32_t)qdf_nbuf_len(head),
 		  (uint32_t)qdf_nbuf_len(rx_nbuf),
 		  (uint32_t)(head->data_len));
+	return QDF_STATUS_SUCCESS;
 }
 
 /**
@@ -909,7 +948,7 @@ static void dp_rx_defrag_err(struct dp_vdev *vdev, qdf_nbuf_t nbuf)
  * Returns: None
  */
 static void
-dp_rx_defrag_nwifi_to_8023(struct dp_soc *soc,
+dp_rx_defrag_nwifi_to_8023(struct dp_soc *soc, struct dp_peer *peer, int tid,
 			   qdf_nbuf_t nbuf, uint16_t hdrsize)
 {
 	struct llc_snap_hdr_t *llchdr;
@@ -918,6 +957,21 @@ dp_rx_defrag_nwifi_to_8023(struct dp_soc *soc,
 	uint16_t fc = 0;
 	union dp_align_mac_addr mac_addr;
 	uint8_t *rx_desc_info = qdf_mem_malloc(RX_PKT_TLVS_LEN);
+	struct rx_pkt_tlvs *rx_pkt_tlv =
+				(struct rx_pkt_tlvs *)qdf_nbuf_data(nbuf);
+	struct rx_mpdu_info *rx_mpdu_info_details =
+		&rx_pkt_tlv->mpdu_start_tlv.rx_mpdu_start.rx_mpdu_info_details;
+	struct dp_rx_tid *rx_tid = &peer->rx_tid[tid];
+
+	dp_debug("head_nbuf pn_31_0 0x%x pn_63_32 0x%x pn_95_64 0x%x pn_127_96 0x%x\n",
+		 rx_mpdu_info_details->pn_31_0, rx_mpdu_info_details->pn_63_32,
+		 rx_mpdu_info_details->pn_95_64,
+		 rx_mpdu_info_details->pn_127_96);
+
+	rx_tid->pn128[0] = rx_mpdu_info_details->pn_31_0;
+	rx_tid->pn128[0] |= ((uint64_t)rx_mpdu_info_details->pn_63_32 << 32);
+	rx_tid->pn128[1] = rx_mpdu_info_details->pn_95_64;
+	rx_tid->pn128[1] |= ((uint64_t)rx_mpdu_info_details->pn_127_96 << 32);
 
 	if (!rx_desc_info) {
 		QDF_TRACE(QDF_MODULE_ID_DP, QDF_TRACE_LEVEL_ERROR,
@@ -1328,8 +1382,9 @@ static QDF_STATUS dp_rx_defrag(struct dp_peer *peer, unsigned tid,
 	}
 
 	/* Convert the header to 802.3 header */
-	dp_rx_defrag_nwifi_to_8023(soc, frag_list_head, hdr_space);
-	dp_rx_construct_fraglist(peer, frag_list_head, hdr_space);
+	dp_rx_defrag_nwifi_to_8023(soc, peer, tid, frag_list_head, hdr_space);
+	if (dp_rx_construct_fraglist(peer, tid, frag_list_head, hdr_space))
+		return QDF_STATUS_E_DEFRAG_ERROR;
 
 	return QDF_STATUS_SUCCESS;
 }
